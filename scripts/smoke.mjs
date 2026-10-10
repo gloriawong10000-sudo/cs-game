@@ -1,6 +1,9 @@
-// End-to-end smoke test: builds must already exist in dist/ (`npm run build`).
-// Serves dist/, boots the game in headless Chromium, plays a few seconds, walks the menus in
-// English and Chinese, fails on any console error, and writes screenshots to ./shots/.
+// End-to-end smoke test: build must already exist in dist/ (`pnpm build`).
+// Serves dist/, boots the game in headless Chromium (software GL, low quality) and, for Onslaught
+// and then Deathmatch, starts a run, walks forward and fires, verifies the clock runs, the player
+// moves and shots are counted, then forces the run to end and checks the results screen.
+// Fails on any console error.
+import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { chromium } from 'playwright'
@@ -9,10 +12,9 @@ const port = 4300 + Math.floor(Math.random() * 500)
 const url = `http://127.0.0.1:${port}/`
 const out = process.env.SHOTS_DIR ?? 'shots'
 mkdirSync(out, { recursive: true })
-
-const server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', 'preview', '--port', String(port), '--strictPort', '--host', '127.0.0.1'], { stdio: 'ignore', detached: false })
+const server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', 'preview', '--port', String(port), '--strictPort', '--host', '127.0.0.1'], { stdio: 'ignore' })
 let browser
-const guard = setTimeout(() => fail('timed out'), 120_000)
+const guard = setTimeout(() => fail('timed out'), 400_000)
 
 function cleanup() {
   clearTimeout(guard)
@@ -24,124 +26,105 @@ async function fail(msg) {
   cleanup()
   process.exit(1)
 }
-
 async function waitForServer() {
   for (let i = 0; i < 60; i += 1) {
-    try {
-      if ((await fetch(url)).ok) return
-    } catch {}
+    try { if ((await fetch(url)).ok) return } catch {}
     await new Promise(r => setTimeout(r, 250))
   }
   throw new Error('preview server did not start')
 }
 
-async function openGame(context, errors) {
+const state = page => page.evaluate(() => {
+  const { game } = window.__game
+  const p = game.player.position
+  const onslaught = game.gameMode === 'onslaught'
+  return {
+    mode: game.mode,
+    clock: onslaught ? game.runTime : -game.match.timeLeft,
+    shots: game.shots + game.match.stats.shots,
+    pos: { x: p.x, z: p.z },
+  }
+})
+
+async function run(context, button, label, n) {
   const page = await context.newPage()
+  page.setDefaultTimeout(120_000)
+  // Static Vite preview exercises local gameplay; the managed API is verified separately in checkpoint Preview.
+  await page.route('**/api/leaderboards/v1/**', async route => {
+    const request = route.request()
+    const pathname = new URL(request.url()).pathname
+    const path = pathname.slice('/api/leaderboards/v1'.length)
+    let status = 200
+    let body
+    if (request.method() === 'POST' && path === '/guests') {
+      status = 201
+      body = { token: `smoke-${randomUUID()}` }
+    } else if (request.method() === 'POST' && /^\/boards\/[A-Za-z0-9_-]+\/runs$/.test(path)) {
+      status = 201
+      body = { runId: randomUUID(), expiresInSeconds: 1800, rulesVersion: 'v1', protocolVersion: 1 }
+    } else if (request.method() === 'GET' && /^\/boards\/[A-Za-z0-9_-]+$/.test(path)) {
+      const boardId = path.split('/')[2]
+      body = { namespace: 'smoke', boardId, rulesVersion: 'v1', trust: 'client_reported', entries: [], myRank: null }
+    } else if (request.method() === 'PUT' && /^\/runs\/[a-f0-9-]+$/i.test(path)) {
+      const runId = path.split('/')[2]
+      const { score } = request.postDataJSON()
+      body = { runId, score, accepted: true, trust: 'client_reported' }
+    } else {
+      status = 404
+      body = { error: 'not_found' }
+    }
+    await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+  })
+  const errors = []
   page.on('console', m => m.type() === 'error' && errors.push(m.text()))
   page.on('pageerror', e => errors.push(String(e)))
   page.on('response', r => r.status() >= 400 && errors.push(`HTTP ${r.status()} ${r.url()}`))
   await page.goto(url)
-  await page.waitForSelector('[data-screen="title"].is-active', { timeout: 30_000 })
-  await page.evaluate(async () => {
-    await document.fonts.ready
-    const expected = document.documentElement.lang === 'zh-CN' ? 'ManusCC0 Sans CJK SC' : 'ManusCC0'
-    for (const selector of ['.logo-text', '.tagline']) {
-      const family = getComputedStyle(document.querySelector(selector)).fontFamily
-      if (!family.startsWith(`"${expected}"`) && !family.startsWith(expected + ',')) {
-        throw new Error(`Unexpected game font: ${family}`)
-      }
-    }
-    if (![...document.fonts].some(face => face.family.replaceAll('"', '').replaceAll("'", '') === expected && face.status === 'loaded')) {
-      throw new Error(`Bundled font did not load: ${expected}`)
-    }
+  await page.waitForFunction(() => document.body.dataset.screen === 'title', null, { timeout: 120_000 })
+  if (n === 0) await page.screenshot({ path: `${out}/smoke-01-title.png` })
+  await page.click(button)
+  await page.evaluate(() => (window.__game.input.debugLock = true))
+  await page.waitForFunction(() => window.__game.game.mode === 'playing', null, { timeout: 90_000 })
+  const before = await state(page)
+  await page.keyboard.down('KeyW')
+  await page.evaluate(() => {
+    window.__game.input.debugPress('fire')
+    window.__game.input.debugHeld.add('fire')
   })
-  await page.waitForTimeout(900)
-  return page
+  await page.waitForTimeout(3000)
+  await page.evaluate(() => window.__game.input.debugHeld.delete('fire'))
+  await page.keyboard.up('KeyW')
+  await page.screenshot({ path: `${out}/smoke-0${2 + n * 2}-${label}-play.png` })
+  const after = await state(page)
+  const moved = Math.hypot(after.pos.x - before.pos.x, after.pos.z - before.pos.z)
+  if (after.mode !== 'playing') throw new Error(`${label}: expected playing, got ${after.mode}`)
+  if (!(after.clock > before.clock)) throw new Error(`${label}: clock did not run`)
+  if (after.shots <= before.shots) throw new Error(`${label}: no shots registered`)
+  if (moved < 1) throw new Error(`${label}: player barely moved (${moved.toFixed(2)} m)`)
+  await page.evaluate(() => {
+    const g = window.__game.game
+    if (g.gameMode === 'onslaught') g.endMatch(false)
+    else g.match = { ...g.match, timeLeft: 0.5 }
+  })
+  await page.waitForFunction(() => document.body.dataset.screen === 'results', null, { timeout: 60_000 })
+  await page.screenshot({ path: `${out}/smoke-0${3 + n * 2}-${label}-results.png` })
+  if (errors.length) throw new Error(`${label}: console errors:\n${errors.join('\n')}`)
+  await page.close()
+  return `${label} moved ${moved.toFixed(1)} m, ${after.shots} shots, results shown`
 }
-
-const state = page => page.evaluate(() => {
-  const { game } = window.__game
-  const p = game['player'].root.position
-  return { mode: game.mode, run: game.run, pos: { x: p.x, y: p.y, z: p.z } }
-})
 
 try {
   await waitForServer()
-  // Prefer Playwright's bundled Chromium; fall back to an installed Google Chrome.
-  const args = ['--ignore-gpu-blocklist']
-  browser = await chromium.launch({ args }).catch(() => chromium.launch({ args, channel: 'chrome' }))
-  const errors = []
-
-  const en = await browser.newContext({ viewport: { width: 1280, height: 720 }, locale: 'en-US' })
-  const page = await openGame(en, errors)
-  await page.screenshot({ path: `${out}/01-title-en.png` })
-
-  await page.click('[data-action="play"]')
-  await page.waitForSelector('[data-screen="hud"].is-active')
-  const before = await state(page)
-  await page.keyboard.down('KeyW')
-  await page.waitForTimeout(700)
-  await page.keyboard.press('Space')
-  await page.waitForTimeout(900)
-  await page.keyboard.up('KeyW')
-  await page.waitForTimeout(600)
-  await page.screenshot({ path: `${out}/02-gameplay.png` })
-  const after = await state(page)
-  const moved = Math.hypot(after.pos.x - before.pos.x, after.pos.z - before.pos.z)
-  if (after.mode !== 'playing') throw new Error(`expected playing, got ${after.mode}`)
-  if (!(after.run.timeLeft < before.run.timeLeft)) throw new Error('clock did not run')
-  if (moved < 2) throw new Error(`player barely moved (${moved.toFixed(2)} m)`)
-  console.log(`smoke: moved ${moved.toFixed(1)} m, clock ${after.run.timeLeft.toFixed(1)} s`)
-
-  await page.keyboard.press('Escape')
-  await page.waitForSelector('[data-screen="pause"].is-active')
-  await page.waitForTimeout(400)
-  await page.screenshot({ path: `${out}/03-pause.png` })
-  await page.click('[data-screen="pause"] [data-action="settings"]')
-  await page.waitForSelector('[data-screen="settings"].is-active')
-  await page.waitForTimeout(400)
-  await page.screenshot({ path: `${out}/04-settings.png` })
-  await page.keyboard.press('Escape')
-  await page.waitForSelector('[data-screen="pause"].is-active')
-  await page.waitForTimeout(300)
-  if ((await state(page)).mode !== 'paused') throw new Error('leaving Settings with Escape resumed the run')
-
-  // Results: finish the run through the real rules by collecting the remaining cores.
-  await page.evaluate(() => {
-    const { game } = window.__game
-    const cores = game['cores']
-    game.resume()
-    for (const p of cores.remaining()) {
-      game['player'].teleport(p)
-      game.step(1 / 60)
-    }
-  })
-  await page.waitForSelector('[data-screen="results"].is-active', { timeout: 10_000 })
-  await page.waitForTimeout(1500)
-  await page.screenshot({ path: `${out}/05-results.png` })
-  const done = await state(page)
-  if (done.run.phase !== 'won') throw new Error(`expected a won run, got ${done.run.phase}`)
-  await en.close()
-
-  const zh = await browser.newContext({ viewport: { width: 1280, height: 720 }, locale: 'zh-CN' })
-  const zhPage = await openGame(zh, errors)
-  const lang = await zhPage.evaluate(() => document.documentElement.lang)
-  if (lang !== 'zh-CN') throw new Error(`browser language not detected (lang=${lang})`)
-  await zhPage.screenshot({ path: `${out}/06-title-zh.png` })
-  await zh.close()
-
-  const phone = await browser.newContext({ viewport: { width: 844, height: 390 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, locale: 'zh-CN' })
-  const phonePage = await openGame(phone, errors)
-  await phonePage.tap('[data-action="play"]')
-  await phonePage.waitForSelector('[data-screen="hud"].is-active')
-  await phonePage.waitForTimeout(1200)
-  await phonePage.screenshot({ path: `${out}/07-phone-hud.png` })
-  await phone.close()
-
-  if (errors.length) throw new Error(`console errors:\n  ${errors.join('\n  ')}`)
+  const args = ['--ignore-gpu-blocklist', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']
+  browser = await chromium.launch({ args })
+  const context = await browser.newContext({ viewport: { width: 960, height: 540 } })
+  await context.addInitScript(() => localStorage.setItem('ironrift.save', JSON.stringify({ version: 1, quality: 'low' })))
+  const a = await run(context, '.screen-title .btn.primary', 'onslaught', 0)
+  const b = await run(context, '.screen-title .btn:not(.primary)', 'deathmatch', 1)
+  console.log(`smoke: OK — ${a}; ${b}`)
   await browser.close()
   cleanup()
-  console.log(`smoke: OK — screenshots in ${out}/`)
+  process.exit(0)
 } catch (err) {
   await fail(err?.message ?? String(err))
 }

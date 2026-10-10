@@ -2,15 +2,16 @@
  * Versioned local save. Everything the player keeps between sessions lives in one JSON record so
  * it is easy to migrate. Corrupt or foreign data falls back to defaults instead of crashing.
  */
-export type Locale = 'en' | 'zh-CN'
+export type Locale = 'zh-Hant'
 export type Quality = 'low' | 'medium' | 'high'
 
 export type ScoreEntry = { name: string; score: number; seconds: number; at: number }
 
 export type SaveData = {
   version: 1
-  /** '' = never chosen; the game follows the browser language until the player picks one. */
+  /** Kept for save compatibility; the game is Traditional Chinese-only. */
   locale: Locale | ''
+  fov: number
   musicVolume: number
   sfxVolume: number
   muted: boolean
@@ -23,14 +24,15 @@ export type SaveData = {
   leaderboard: ScoreEntry[]
 }
 
-export const SAVE_KEY = 'game3d.save'
+export const SAVE_KEY = 'ironrift.save'
 export const LEADERBOARD_SIZE = 10
 
 export function defaultSave(): SaveData {
   return {
     version: 1,
-    locale: '',
-    musicVolume: 0.7,
+    locale: 'zh-Hant',
+    fov: 100,
+    musicVolume: 0.6,
     sfxVolume: 0.8,
     muted: false,
     sensitivity: 1,
@@ -38,7 +40,7 @@ export function defaultSave(): SaveData {
     quality: 'high',
     reducedMotion: false,
     tutorialDone: false,
-    playerName: 'PLAYER',
+    playerName: '玩家',
     leaderboard: [],
   }
 }
@@ -61,7 +63,8 @@ export function parseSave(raw: string | null): SaveData {
   const board = Array.isArray(data.leaderboard) ? data.leaderboard : []
   return {
     version: 1,
-    locale: data.locale === 'en' || data.locale === 'zh-CN' ? data.locale : '',
+    locale: data.locale === 'zh-Hant' ? 'zh-Hant' : base.locale,
+    fov: typeof data.fov === 'number' && data.fov >= 70 && data.fov <= 120 ? Math.round(data.fov) : base.fov,
     musicVolume: clamp01(data.musicVolume, base.musicVolume),
     sfxVolume: clamp01(data.sfxVolume, base.sfxVolume),
     muted: data.muted === true,

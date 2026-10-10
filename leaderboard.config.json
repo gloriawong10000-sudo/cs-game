@@ -1,0 +1,7 @@
+{
+  "identity": "guest",
+  "boards": [
+    { "id": "onslaught-score-v1", "rulesVersion": "v1" },
+    { "id": "deathmatch-score-v1", "rulesVersion": "v1" }
+  ]
+}

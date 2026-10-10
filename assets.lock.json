@@ -1,6 +1,26 @@
 {
   "version": 2,
-  "groups": {},
+  "groups": {
+    "game-sharing": {
+      "name": "Riftline Sharing Artwork",
+      "order": 10
+    }
+  },
   "bundles": {},
-  "assets": {}
+  "assets": {
+    "assets/share/favicon.png": {
+      "path": "/manus-storage/game/sha256/be1ff145a5a6c6edde7f3f5a02c800a60af41dd898a5fcef3857ef68ea2f4d32.png",
+      "sha256": "sha256:be1ff145a5a6c6edde7f3f5a02c800a60af41dd898a5fcef3857ef68ea2f4d32",
+      "size": 433564,
+      "assetType": "image",
+      "groupId": "game-sharing"
+    },
+    "assets/share/og.png": {
+      "path": "/manus-storage/game/sha256/dac31ed2fa72fd18480be0d809ab5c2e46036a0bcb18ec3bed6535428b778a2d.png",
+      "sha256": "sha256:dac31ed2fa72fd18480be0d809ab5c2e46036a0bcb18ec3bed6535428b778a2d",
+      "size": 1390502,
+      "assetType": "image",
+      "groupId": "game-sharing"
+    }
+  }
 }

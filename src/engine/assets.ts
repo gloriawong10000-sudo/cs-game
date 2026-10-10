@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { GLTFLoader, type GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js'
 
 /**
  * Cached asset loading with one progress stream for the boot screen.
@@ -16,6 +17,8 @@ export class Assets {
   private listeners = new Set<(progress: number) => void>()
 
   constructor() {
+    // Character rigs are meshopt-compressed (geometry + animation) to keep the boot payload small.
+    this.gltfLoader.setMeshoptDecoder(MeshoptDecoder)
     this.manager.onProgress = (_url, loaded, total) => {
       const progress = total > 0 ? loaded / total : 1
       for (const fn of this.listeners) fn(progress)

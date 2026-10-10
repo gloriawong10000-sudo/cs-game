@@ -1,42 +1,60 @@
 import './styles/main.css'
 import { Audio } from './engine/audio'
-import { I18n, resolveLocale } from './engine/i18n'
+import { I18n } from './engine/i18n'
 import { Input } from './engine/input'
 import { GameLoop } from './engine/loop'
 import { SAVE_KEY, SaveStore, type SaveData } from './engine/save'
-import type { Game } from './game/game'
-import { TouchControls } from './ui/touch'
+import { GuestLeaderboards, type RankedRun } from './engine/online-leaderboard'
+import type { Game, GameMode } from './game/game'
 import { Ui } from './ui/ui'
 
+/**
+ * Boot flow (staged streaming):
+ *  1. The loading screen (with its painted backdrop) shows immediately.
+ *  2. Code, Rapier WASM, the arena library and Stage 1 (rifle, shotgun, robot rig, VFX atlases,
+ *     core SFX) load in parallel — exactly what the title screen and Wave 1 need.
+ *  3. Title screen appears. Stages 2–4 (drones, heavies, boss) stream in the background one file at
+ *     a time, pausing whenever combat heats up (many enemies/particles or rising frame time).
+ *     Before a wave needs a stage, the game calls ensure(), which jumps it to the front.
+ */
 async function boot(): Promise<void> {
   const canvas = document.querySelector<HTMLCanvasElement>('#game')!
   const firstRun = safeGet(SAVE_KEY) === null
   const save = new SaveStore()
-
-  const i18n = new I18n(resolveLocale(save.data.locale, navigator.languages))
+  const i18n = new I18n()
   const input = new Input(canvas)
   const audio = new Audio()
+  const leaderboards = new GuestLeaderboards()
   let game: Game | undefined
   let lockLostAt = 0
-
+  let activeRankedRun: ReturnType<GuestLeaderboards['begin']> | null = null
+  let retryTarget: { run: RankedRun; score: number; durationMs: number } | null = null
+  let retryInProgress = false
   const applySettings = (d: SaveData) => {
     input.sensitivity = d.sensitivity
     input.invertY = d.invertY
     audio.setVolumes(d.musicVolume, d.sfxVolume, d.muted)
-    if (game) game.reducedMotion = d.reducedMotion
+    if (game) {
+      game.reducedMotion = d.reducedMotion
+      game.fovSetting = d.fov
+    }
   }
-
-  const startRun = (tutorial: boolean) => {
+  const startMatch = (mode?: GameMode) => {
     if (!game) return
+    const selectedMode = mode ?? game.gameMode
     audio.unlock()
-    audio.startMusic()
-    game.start(tutorial)
+    audio.retryMusic()
+    ui.resetHud()
+    game.start(selectedMode)
+    activeRankedRun = game.match.unranked ? null : leaderboards.begin(selectedMode, save.data.playerName)
+    retryTarget = null
     ui.show('hud')
     loop.resetAccumulator()
     input.lockPointer()
   }
   const pause = () => {
-    if (game?.mode !== 'playing') return
+    if (game?.mode !== 'playing' && game?.mode !== 'countdown') return
+    if (game.choosingPerk) return
     game.pause()
     ui.show('pause')
     input.unlockPointer()
@@ -46,15 +64,22 @@ async function boot(): Promise<void> {
     game.resume()
     ui.show('hud')
     loop.resetAccumulator()
-    input.lockPointer()
+    if (!game.choosingPerk) input.lockPointer()
   }
-
-  const ui = new Ui(i18n, save, audio, input, {
-    play: () => startRun(!save.data.tutorialDone),
-    restart: () => startRun(false),
+  const pickPerk = (i: number) => {
+    if (!game?.choosingPerk) return
+    game.choosePerk(i)
+    if (game.mode === 'playing') input.lockPointer()
+  }
+  const ui = new Ui(i18n, save, audio, {
+    play: mode => startMatch(mode),
+    restart: () => startMatch(),
     resume,
     quit: () => {
       game?.toTitle()
+      activeRankedRun = null
+      retryTarget = null
+      ui.resetHud()
       ui.show('title')
       input.unlockPointer()
     },
@@ -62,69 +87,164 @@ async function boot(): Promise<void> {
       const qualityChanged = patch.quality !== undefined && patch.quality !== save.data.quality
       save.update(patch)
       applySettings(save.data)
-      if (patch.locale) i18n.set(patch.locale)
-      if (qualityChanged) game?.setQuality(save.data.quality)
+      if (qualityChanged && game) {
+        game.renderer.applyQuality(save.data.quality)
+        game.setQuality()
+      }
     },
+    pickPerk,
+    loadOnlineLeaderboard: mode => {
+      void leaderboards.list(mode).then(result => ui.setOnlineLeaderboard(mode, result)).catch(() => ui.setOnlineLeaderboard(mode, { ok: false, error: 'leaderboard_unavailable' }))
+    },
+    retryOnlineSubmission: () => { void retryOnlineSubmission() },
   })
+  async function retryOnlineSubmission(): Promise<void> {
+    const target = retryTarget
+    if (!target || retryInProgress) return
+    retryInProgress = true
+    ui.setOnlineSubmitting(target.run.mode)
+    try {
+      const result = await leaderboards.retry(target.run)
+      if (result.ok && result.value.leaderboard.ok) retryTarget = null
+      else if (!result.ok && ['client_upgrade_required', 'invalid_score', 'run_not_owned', 'run_expired', 'run_rules_changed', 'submission_conflict'].includes(result.error)) retryTarget = null
+      else if (result.ok && !result.value.leaderboard.ok && ['client_upgrade_required', 'invalid_score', 'run_expired', 'run_rules_changed'].includes(result.value.leaderboard.error)) retryTarget = null
+      ui.setOnlineSubmission(target.run.mode, result)
+    } catch {
+      ui.setOnlineError(target.run.mode, 'leaderboard_unavailable', true)
+    } finally {
+      retryInProgress = false
+    }
+  }
   ui.show('boot')
   applySettings(save.data)
+  // Keep the spark layer and loading tips alive while the heavy modules download.
+  let bootRaf = 0
+  let bootLast = performance.now()
+  const bootTick = (now: number) => {
+    ui.tick(Math.min(0.05, (now - bootLast) / 1000))
+    bootLast = now
+    bootRaf = requestAnimationFrame(bootTick)
+  }
+  bootRaf = requestAnimationFrame(bootTick)
 
-  // Boot: the UI above is already on screen; three.js, Rapier (WASM) and the game load as a
-  // separate chunk behind the progress bar. Preload models/textures here too (engine/assets.ts).
-  let loaded = 0
-  const track = <T>(p: Promise<T>): Promise<T> => p.then(v => (ui.setBootProgress(0.1 + (++loaded / 4) * 0.9), v))
-  ui.setBootProgress(0.1)
-  const [{ Game }, { Renderer, suggestQuality }, physics] = await Promise.all([
-    track(import('./game/game')),
-    track(import('./engine/renderer')),
-    track(import('./engine/physics')),
-    track(document.fonts.ready),
+  const parts = { code: 0, library: 0, stage: 0 }
+  const progress = (label?: string) => ui.setBootProgress(0.04 + parts.code * 0.16 + parts.library * 0.5 + parts.stage * 0.3, label)
+  progress('INITIALISING RIFT')
+  const [{ Game }, { Renderer, suggestQuality }, physics, { Assets }, { loadLibrary }, { StageLoader }] = await Promise.all([
+    import('./game/game'),
+    import('./engine/renderer'),
+    import('./engine/physics'),
+    import('./engine/assets'),
+    import('./game/library'),
+    import('./game/stages'),
+    document.fonts.ready,
   ])
   await physics.initPhysics()
+  parts.code = 1
+  progress('BUILDING ARENA')
   if (firstRun) {
     save.update({ quality: suggestQuality() })
     ui.refreshSettings()
   }
-
   const renderer = new Renderer(canvas, save.data.quality)
-  game = new Game(renderer, input, audio, {
-    popup: (text, at, kind) => ui.popup(text, at, kind),
-    hurt: () => ui.hurt(),
-    hint: hint => ui.hint(hint),
-    tutorialDone: () => save.update({ tutorialDone: true }),
-    end: run => {
+  const assets = new Assets()
+  const aniso = renderer.gl.capabilities.getMaxAnisotropy()
+  const loader = new StageLoader(assets, audio, aniso)
+  const [lib] = await Promise.all([
+    loadLibrary(assets, aniso, p => {
+      parts.library = p
+      progress()
+    }),
+    loader.boot(p => {
+      parts.stage = p
+      progress(p < 1 ? 'ARMING WAVE 1' : undefined)
+    }),
+  ])
+  progress('CALIBRATING OPTICS')
+  game = new Game(renderer, input, audio, lib, loader.staged, loader, {
+    ...ui.events,
+    perks: offer => {
+      ui.events.perks(offer)
+      // Free the cursor so the perk cards can be clicked; re-lock after the pick.
+      if (offer) input.unlockPointer()
+    },
+    perkChosen: i => ui.perkChosen(i),
+    ended: (match, summary) => {
       input.unlockPointer()
-      window.setTimeout(() => ui.showResults(run), run.phase === 'won' ? 1400 : 900)
+      ui.showResults(match, game!.standings(), summary)
+      const mode = summary?.mode ?? game!.gameMode
+      if (summary?.unranked || match.unranked) {
+        activeRankedRun = null
+        retryTarget = null
+        ui.setOnlineError(mode, 'unranked_run')
+        return
+      }
+      const pending = activeRankedRun
+      activeRankedRun = null
+      if (!pending) {
+        ui.setOnlineError(mode, 'run_not_started')
+        return
+      }
+      const score = summary?.score ?? match.score
+      const durationMs = Math.max(0, Math.round((summary?.time ?? match.elapsed) * 1000))
+      ui.setOnlineSubmitting(mode)
+      void pending.then(async started => {
+        if (!started.ok) {
+          ui.setOnlineError(mode, started.error)
+          return
+        }
+        retryTarget = { run: started.value, score, durationMs }
+        const result = await leaderboards.submit(started.value, score, durationMs)
+        if (result.ok && result.value.leaderboard.ok) retryTarget = null
+        else if (!result.ok && ['client_upgrade_required', 'invalid_score', 'run_not_owned', 'run_expired', 'run_rules_changed', 'submission_conflict'].includes(result.error)) retryTarget = null
+        else if (result.ok && !result.value.leaderboard.ok && ['client_upgrade_required', 'invalid_score', 'run_expired', 'run_rules_changed'].includes(result.value.leaderboard.error)) retryTarget = null
+        ui.setOnlineSubmission(mode, result)
+      }).catch(() => ui.setOnlineError(mode, 'leaderboard_unavailable'))
     },
   })
-  game.reducedMotion = save.data.reducedMotion
+  applySettings(save.data)
+  const g = game
   if (import.meta.env.DEV) {
-    const [{ registerGameTuning }, { tuning }] = await Promise.all([
-      import('../scripts/manus-tuning/adapter.js'), import('./game/tuning'),
-    ])
+    const [{ registerGameTuning }, { tuning }] = await Promise.all([import('../scripts/manus-tuning/adapter.js'), import('./game/tuning')])
     await registerGameTuning(tuning)
   }
-  const g = game
+  // Warm up shaders for every material present so the first explosion does not hitch.
+  renderer.gl.compile(g.scene, g.camera)
 
+  // Background streaming waits while the fight is heavy (enemy/VFX counts or slow frames).
+  let frameAvg = 16
+  loader.isBusy = () => g.isBusy() || frameAvg > 21 || document.hidden
   const loop = new GameLoop({
     step: dt => g.step(dt),
     render: (alpha, frameSeconds) => {
+      frameAvg += (Math.min(0.1, frameSeconds) * 1000 - frameAvg) * 0.05
+      // Real frame time drives the VFX budget (bulk emitters shed particles when frames run long).
+      g.fx.frameTime(frameSeconds * 1000)
       input.update()
       if (input.consume('pause') && performance.now() - lockLostAt > 300) {
-        if (g.mode === 'playing') pause()
+        if (g.mode === 'playing' || g.mode === 'countdown') pause()
         else if (g.mode === 'paused' && ui.screen === 'pause') resume()
       }
-      ui.frame(frameSeconds)
-      loop.paused = g.mode === 'paused'
+      // Keyboard perk selection (1–3) while the perk cards are up.
+      if (g.choosingPerk) {
+        if (input.consume('slot1')) pickPerk(0)
+        else if (input.consume('slot2')) pickPerk(1)
+        else if (input.consume('slot3')) pickPerk(2)
+      }
       g.render(alpha, frameSeconds)
-      if (g.mode === 'playing' || g.mode === 'ended') ui.updateHud(g.run, g.compass())
+      ui.tick(frameSeconds)
+      if (g.mode === 'playing' || g.mode === 'countdown' || g.mode === 'ended' || g.mode === 'paused') {
+        const pxPerRad = window.innerHeight / 2 / Math.tan((g.camera.fov * Math.PI) / 360)
+        ui.updateHud(g.hud(), g.standings(), input.held('scoreboard'), pxPerRad, frameSeconds)
+      }
     },
   })
+  cancelAnimationFrame(bootRaf)
+  ui.setBootProgress(1, 'READY')
   loop.start()
-
   document.addEventListener('pointerlockchange', () => {
     // Browsers release pointer lock on Escape without delivering the key: treat that as pause.
-    if (!document.pointerLockElement && g.mode === 'playing' && input.method === 'keyboard') {
+    if (!document.pointerLockElement && (g.mode === 'playing' || g.mode === 'countdown') && input.method === 'keyboard' && !g.choosingPerk) {
       lockLostAt = performance.now()
       pause()
     }
@@ -134,13 +254,24 @@ async function boot(): Promise<void> {
   })
   window.addEventListener('game:pause', pause)
   canvas.addEventListener('click', () => {
-    if (g.mode === 'playing') input.lockPointer()
+    if ((g.mode === 'playing' || g.mode === 'countdown') && !g.choosingPerk) input.lockPointer()
   })
-  new TouchControls(document.getElementById('ui')!, input, () => g.mode === 'playing')
-
-  window.setTimeout(() => ui.show('title'), 250)
-  // Debug/test hook (read-only use): smoke tests inspect run state through it.
-  ;(window as unknown as { __game: unknown }).__game = { game: g, ui, input, save }
+  // First gesture unlocks audio and (re)starts music blocked by the autoplay policy.
+  const gesture = () => {
+    audio.unlock()
+    audio.retryMusic()
+  }
+  window.addEventListener('pointerdown', gesture)
+  window.addEventListener('keydown', gesture)
+  window.setTimeout(() => {
+    ui.show('title')
+    document.getElementById('boot-ph')?.remove()
+    audio.playMusic('title', 1.5)
+    // Background streaming starts once the title is up.
+    window.setTimeout(() => loader.startBackground(), 600)
+  }, 250)
+  // Debug/test hook (read-only use): smoke tests inspect match state through it.
+  ;(window as unknown as { __game: unknown }).__game = { game: g, ui, input, save, loader, audio }
 }
 
 function safeGet(key: string): string | null {
@@ -153,6 +284,19 @@ function safeGet(key: string): string | null {
 
 boot().catch(err => {
   console.error(err)
-  const el = document.getElementById('ui')
-  if (el) el.innerHTML = `<div class="fatal">Failed to start: ${String((err as Error)?.message ?? err).replace(/[<>&]/g, '')}</div>`
+  const root = document.getElementById('ui')
+  if (!root) return
+  const fatal = document.createElement('div')
+  fatal.className = 'fatal'
+  const content = document.createElement('div')
+  content.className = 'fatal-content'
+  const message = document.createElement('p')
+  message.textContent = `遊戲載入失敗：${String((err as Error)?.message ?? err)}`
+  const retry = document.createElement('button')
+  retry.className = 'btn primary'
+  retry.textContent = '重新載入'
+  retry.addEventListener('click', () => window.location.reload())
+  content.append(message, retry)
+  fatal.appendChild(content)
+  root.replaceChildren(fatal)
 })

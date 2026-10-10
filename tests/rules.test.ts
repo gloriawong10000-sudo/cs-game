@@ -1,73 +1,94 @@
 import { describe, expect, it } from 'vitest'
-import { CONFIG } from '../src/game/config'
-import { collect, createRun, damage, formatClock, stars, tick } from '../src/game/rules'
+import { applyDamage, computeScore, createMatch, finalizeMatchResult, formatClock, placement, registerKill, splashDamage, tick, PLAYER_ID } from '../src/game/rules'
 
-describe('run rules', () => {
-  it('scores cores with a combo multiplier that resets after the window', () => {
-    let s = createRun(10)
-    let r = collect(s)
-    expect(r.points).toBe(CONFIG.score.core)
-    s = collect(r.state).state
-    expect(s.combo).toBe(2)
-    expect(s.score).toBe(CONFIG.score.core * 3)
-    s = tick(s, CONFIG.score.comboWindow + 0.01)
-    expect(s.combo).toBe(0)
-    r = collect(s)
-    expect(r.points).toBe(CONFIG.score.core)
+const bots = ['VIPER', 'HAVOC', 'WRAITH']
+
+describe('deathmatch rules', () => {
+  it('counts frags, deaths and first blood', () => {
+    const s = createMatch(bots, 360, 20)
+    const r = registerKill(s, { killer: PLAYER_ID, victim: 1 })
+    expect(r.medals).toContain('first')
+    expect(r.state.combatants[0].kills).toBe(1)
+    expect(r.state.combatants[1].deaths).toBe(1)
+    const r2 = registerKill(r.state, { killer: 2, victim: 3 })
+    expect(r2.medals).toEqual([])
   })
 
-  it('caps the combo', () => {
-    let s = createRun(20)
-    for (let i = 0; i < 10; i += 1) s = collect(s).state
-    expect(s.combo).toBe(CONFIG.score.comboMax)
+  it('awards double kills inside the multi-kill window and resets after it', () => {
+    let s = createMatch(bots, 360, 20)
+    s = registerKill(s, { killer: PLAYER_ID, victim: 1 }).state
+    const r = registerKill(s, { killer: PLAYER_ID, victim: 2 })
+    expect(r.medals).toContain('double')
+    const later = tick(r.state, 5)
+    expect(registerKill(later, { killer: PLAYER_ID, victim: 3 }).medals).not.toContain('triple')
   })
 
-  it('wins on the last core and adds time and life bonuses', () => {
-    let s = createRun(1)
-    s = tick(s, 10)
-    s = collect(s).state
+  it('suicide removes a frag without going negative', () => {
+    let s = createMatch(bots, 360, 20)
+    s = registerKill(s, { killer: PLAYER_ID, victim: PLAYER_ID }).state
+    expect(s.combatants[0].kills).toBe(0)
+    expect(s.combatants[0].deaths).toBe(1)
+  })
+
+  it('awards revenge on the last bot that killed the player', () => {
+    let s = createMatch(bots, 360, 20)
+    s = registerKill(s, { killer: 2, victim: PLAYER_ID }).state
+    expect(registerKill(s, { killer: PLAYER_ID, victim: 2 }).medals).toContain('revenge')
+  })
+
+  it('ends on the frag limit and on time with the correct outcome', () => {
+    let s = createMatch(bots, 360, 2)
+    s = registerKill(s, { killer: PLAYER_ID, victim: 1 }).state
+    s = registerKill(s, { killer: PLAYER_ID, victim: 2 }).state
     expect(s.phase).toBe('won')
-    expect(s.timeBonus).toBe(Math.ceil(CONFIG.run.seconds - 10) * CONFIG.score.timeBonus)
-    expect(s.lifeBonus).toBe(CONFIG.run.lives * CONFIG.score.lifeBonus)
-    expect(s.score).toBe(CONFIG.score.core + s.timeBonus + s.lifeBonus)
-  })
+    expect(s.endReason).toBe('frags')
+    expect(s.score).toBeGreaterThan(0)
 
-  it('ignores hits while invulnerable but not falls', () => {
-    let s = createRun(5)
-    s = damage(s).state
-    expect(s.lives).toBe(CONFIG.run.lives - 1)
-    expect(damage(s).hurt).toBe(false)
-    s = damage(s, true).state
-    expect(s.lives).toBe(CONFIG.run.lives - 2)
-  })
-
-  it('loses on zero lives or when time runs out', () => {
-    let s = createRun(5)
-    for (let i = 0; i < CONFIG.run.lives; i += 1) s = damage(s, true).state
-    expect(s.phase).toBe('lost')
-    expect(s.loseReason).toBe('lives')
-    const t = tick(createRun(5), CONFIG.run.seconds)
+    let t = createMatch(bots, 10, 20)
+    t = registerKill(t, { killer: 1, victim: PLAYER_ID }).state
+    t = tick(t, 11)
     expect(t.phase).toBe('lost')
-    expect(t.loseReason).toBe('time')
+    expect(t.endReason).toBe('time')
+    expect(placement(t)).toBeGreaterThan(1)
+    // Finished matches ignore further events.
+    expect(registerKill(t, { killer: PLAYER_ID, victim: 1 }).state).toBe(t)
   })
 
-  it('freezes state after the run ends', () => {
-    const lost = tick(createRun(5), CONFIG.run.seconds)
-    expect(tick(lost, 1)).toBe(lost)
-    expect(collect(lost).points).toBe(0)
+  it('finalizes post-start gameplay tuning as unranked before recording the result', () => {
+    const s = createMatch(bots, 360, 20)
+    const tuned = finalizeMatchResult(s, true)
+    expect(tuned.unranked).toBe(true)
+    expect(tuned.score).toBe(computeScore(tuned))
+    expect(finalizeMatchResult({ ...s, unranked: true }, false).unranked).toBe(true)
   })
 
-  it('rates stars', () => {
-    let s = collect(createRun(1)).state
-    expect(stars(s)).toBe(3)
-    s = collect(damage(tick(createRun(1), CONFIG.run.seconds * 0.6)).state).state
-    expect(stars(s)).toBe(1)
-    expect(stars(createRun(1))).toBe(0)
+  it('player wins ties on placement', () => {
+    let s = createMatch(bots, 360, 20)
+    s = registerKill(s, { killer: PLAYER_ID, victim: 1 }).state
+    s = registerKill(s, { killer: 2, victim: 3 }).state
+    expect(placement(s)).toBe(1)
   })
 
-  it('formats the clock', () => {
-    expect(formatClock(150)).toBe('2:30')
+  it('armor absorbs part of the damage until depleted', () => {
+    expect(applyDamage(100, 0, 30, 0.6)).toEqual({ health: 70, armor: 0 })
+    const a = applyDamage(100, 50, 30, 0.6)
+    expect(a.armor).toBeCloseTo(32)
+    expect(a.health).toBeCloseTo(88)
+    const b = applyDamage(100, 5, 30, 0.6)
+    expect(b.armor).toBe(0)
+    expect(b.health).toBeCloseTo(75)
+  })
+
+  it('splash damage falls off and is zero outside the radius', () => {
+    expect(splashDamage(100, 6, 0)).toBeCloseTo(100)
+    expect(splashDamage(100, 6, 3)).toBeLessThan(100)
+    expect(splashDamage(100, 6, 3)).toBeGreaterThan(25)
+    expect(splashDamage(100, 6, 6)).toBe(0)
+  })
+
+  it('formats the match clock', () => {
+    expect(formatClock(360)).toBe('6:00')
     expect(formatClock(59.2)).toBe('1:00')
-    expect(formatClock(0)).toBe('0:00')
+    expect(formatClock(-3)).toBe('0:00')
   })
 })

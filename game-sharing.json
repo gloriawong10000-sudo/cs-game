@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 2,
+  "title": "Riftline: Breach Protocol",
+  "description": "《Riftline: Breach Protocol》是一款繁體中文 3D 第一人稱射擊遊戲，挑戰八波猛攻與機器人死鬥，並將成績送上訪客共享排行榜。",
+  "defaultCaptions": {
+    "x": "來挑戰《Riftline: Breach Protocol》：八波猛攻、機器人死鬥，還有訪客共享排行榜。",
+    "facebook": "《Riftline: Breach Protocol》是繁體中文 3D 第一人稱射擊遊戲，結合風格評級、波間強化和訪客共享排行榜。",
+    "reddit": "《Riftline: Breach Protocol》——在八波猛攻與機器人死鬥中測試你的反應，並挑戰訪客共享排行榜。",
+    "discord": "Riftline: Breach Protocol｜八波猛攻、機器人死鬥，登上訪客共享排行榜。"
+  },
+  "assets": {
+    "og": "assets/share/og.png",
+    "favicon": "assets/share/favicon.png"
+  }
+}
